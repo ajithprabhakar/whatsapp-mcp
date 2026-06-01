@@ -13,6 +13,8 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -103,6 +105,21 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 	_, err := store.db.Exec(
 		"INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
 		jid, name, lastMessageTime,
+	)
+	return err
+}
+
+// UpsertChatName updates ONLY the name for a chat, preserving last_message_time
+// (unlike StoreChat's INSERT OR REPLACE, which would zero the ordering
+// timestamp). Used by the group-subject refresh + rename events so a metadata
+// refresh never disturbs message ordering. Inserts a row with zero time if the
+// chat has never been seen (e.g. a joined group we've not yet received a
+// message from) so its subject is still captured.
+func (store *MessageStore) UpsertChatName(jid, name string) error {
+	_, err := store.db.Exec(
+		`INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)
+		 ON CONFLICT(jid) DO UPDATE SET name = excluded.name`,
+		jid, name, time.Time{},
 	)
 	return err
 }
@@ -641,7 +658,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -774,6 +791,44 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for listing joined groups with authoritative subjects (read-only).
+	// The Python sync reads this instead of trusting cached chats.name, so real
+	// subjects + topics reach social.whatsapp_groups.
+	http.HandleFunc("/api/groups", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		groups, err := client.GetJoinedGroups(context.Background())
+		if err != nil {
+			http.Error(w, fmt.Sprintf("GetJoinedGroups failed: %v", err), http.StatusInternalServerError)
+			return
+		}
+		type groupOut struct {
+			JID              string `json:"jid"`
+			Name             string `json:"name"`
+			Topic            string `json:"topic"`
+			ParticipantCount int    `json:"participant_count"`
+		}
+		out := make([]groupOut, 0, len(groups))
+		for _, g := range groups {
+			count := g.ParticipantCount
+			if count == 0 {
+				count = len(g.Participants)
+			}
+			out = append(out, groupOut{
+				JID:              g.JID.String(),
+				Name:             g.Name,
+				Topic:            g.Topic,
+				ParticipantCount: count,
+			})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(out); err != nil {
+			fmt.Printf("/api/groups encode failed: %v\n", err)
+		}
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -800,14 +855,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -844,6 +899,25 @@ func main() {
 		case *events.HistorySync:
 			// Process history sync events
 			handleHistorySync(client, messageStore, v, logger)
+
+		case *events.GroupInfo:
+			// Group metadata changed; if the subject was renamed, propagate it
+			// immediately (the periodic refresh is only a backstop).
+			if v.Name != nil && v.Name.Name != "" {
+				if err := messageStore.UpsertChatName(v.JID.String(), v.Name.Name); err != nil {
+					logger.Warnf("GroupInfo rename store failed for %s: %v", v.JID, err)
+				} else {
+					logger.Infof("Group %s renamed to %q", v.JID, v.Name.Name)
+				}
+			}
+
+		case *events.JoinedGroup:
+			// Newly joined/created group — capture its subject right away.
+			if v.GroupInfo.Name != "" {
+				if err := messageStore.UpsertChatName(v.JID.String(), v.GroupInfo.Name); err != nil {
+					logger.Warnf("JoinedGroup store failed for %s: %v", v.JID, err)
+				}
+			}
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
@@ -905,8 +979,35 @@ func main() {
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
-	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	// Group-subject refresh: once shortly after connect (to resolve stale
+	// "Group <id>" placeholders + any renames missed while offline) and then on
+	// a timer. GetJoinedGroups returns the whole roster in one IQ, so this is
+	// gentle on whatsmeow. Cadence overridable via GROUP_REFRESH_INTERVAL.
+	go func() {
+		time.Sleep(5 * time.Second) // let initial sync settle
+		refreshGroupSubjects(client, messageStore, logger)
+		interval := 6 * time.Hour
+		if v := os.Getenv("GROUP_REFRESH_INTERVAL"); v != "" {
+			if d, err := time.ParseDuration(v); err == nil && d > 0 {
+				interval = d
+			}
+		}
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for range ticker.C {
+			refreshGroupSubjects(client, messageStore, logger)
+		}
+	}()
+
+	// Start REST API server. PORT env var honors the launchd plist setting
+	// (com.maya.whatsapp-bridge.plist sets 3456); falls back to 8080.
+	port := 8080
+	if envPort := os.Getenv("PORT"); envPort != "" {
+		if p, err := strconv.Atoi(envPort); err == nil && p > 0 {
+			port = p
+		}
+	}
+	startRESTServer(client, messageStore, port)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
@@ -922,13 +1023,53 @@ func main() {
 	client.Disconnect()
 }
 
+// placeholderGroupRe matches the fallback "Group <jid.User>" name the bridge
+// assigns when a group's real subject isn't available yet. Such a name is NOT
+// authoritative — it must be re-resolved once a subject becomes available.
+var placeholderGroupRe = regexp.MustCompile(`^Group \d+$`)
+
+func isPlaceholderGroupName(s string) bool { return placeholderGroupRe.MatchString(s) }
+
+// refreshGroupSubjects pulls the authoritative joined-group roster from
+// WhatsApp (one GetJoinedGroups call returns all groups + subjects, so this is
+// gentle on whatsmeow) and updates chats.name for any group whose real subject
+// differs from what's cached — resolving stale "Group <id>" placeholders and
+// propagating renames. Name-only updates preserve last_message_time ordering.
+func refreshGroupSubjects(client *whatsmeow.Client, store *MessageStore, logger waLog.Logger) {
+	groups, err := client.GetJoinedGroups(context.Background())
+	if err != nil {
+		logger.Warnf("refreshGroupSubjects: GetJoinedGroups failed: %v", err)
+		return
+	}
+	updated := 0
+	for _, g := range groups {
+		if g.Name == "" {
+			continue // WhatsApp has no subject for this group; leave as-is
+		}
+		chatJID := g.JID.String()
+		var existing string
+		_ = store.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existing)
+		if existing == g.Name {
+			continue // already current
+		}
+		if err := store.UpsertChatName(chatJID, g.Name); err != nil {
+			logger.Warnf("refreshGroupSubjects: store %s failed: %v", chatJID, err)
+			continue
+		}
+		updated++
+	}
+	logger.Infof("refreshGroupSubjects: %d joined groups, %d names updated", len(groups), updated)
+}
+
 // GetChatName determines the appropriate name for a chat based on JID and other info
 func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types.JID, chatJID string, conversation interface{}, sender string, logger waLog.Logger) string {
-	// First, check if chat already exists in database with a name
+	// First, check if chat already exists in database with a name.
+	// A "Group <id>" placeholder is NOT authoritative — fall through so a real
+	// subject can replace it once WhatsApp makes one available.
 	var existingName string
 	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
-	if err == nil && existingName != "" {
-		// Chat exists with a name, use that
+	if err == nil && existingName != "" && !isPlaceholderGroupName(existingName) {
+		// Chat exists with a real name, use that
 		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
 		return existingName
 	}
@@ -973,7 +1114,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1129,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {

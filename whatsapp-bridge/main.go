@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
 	"net/http"
@@ -92,7 +93,44 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
+	// Group-avatar cache columns (Phase 2). ALTER is idempotent across restarts:
+	// SQLite has no ADD COLUMN IF NOT EXISTS, so a "duplicate column" error on a
+	// second boot is expected and ignored.
+	for _, col := range []string{
+		"ALTER TABLE chats ADD COLUMN avatar_id TEXT",
+		"ALTER TABLE chats ADD COLUMN avatar_path TEXT",
+	} {
+		if _, aerr := db.Exec(col); aerr != nil && !strings.Contains(aerr.Error(), "duplicate column name") {
+			db.Close()
+			return nil, fmt.Errorf("failed to add avatar column: %v", aerr)
+		}
+	}
+
 	return &MessageStore{db: db}, nil
+}
+
+// GetAvatarID returns the cached profile-picture ID for a chat (empty if none),
+// used as the ExistingID for change-detection so unchanged avatars aren't
+// re-downloaded.
+func (store *MessageStore) GetAvatarID(jid string) string {
+	var id sql.NullString
+	_ = store.db.QueryRow("SELECT avatar_id FROM chats WHERE jid = ?", jid).Scan(&id)
+	if id.Valid {
+		return id.String
+	}
+	return ""
+}
+
+// SetAvatar records the cached avatar id + local file path for a chat
+// (name-only-style update; never disturbs last_message_time).
+func (store *MessageStore) SetAvatar(jid, id, path string) error {
+	_, err := store.db.Exec(
+		`INSERT INTO chats (jid, name, last_message_time, avatar_id, avatar_path)
+		 VALUES (?, '', ?, ?, ?)
+		 ON CONFLICT(jid) DO UPDATE SET avatar_id = excluded.avatar_id, avatar_path = excluded.avatar_path`,
+		jid, time.Time{}, id, path,
+	)
+	return err
 }
 
 // Close the database connection
@@ -809,6 +847,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Name             string `json:"name"`
 			Topic            string `json:"topic"`
 			ParticipantCount int    `json:"participant_count"`
+			AvatarID         string `json:"avatar_id"`
 		}
 		out := make([]groupOut, 0, len(groups))
 		for _, g := range groups {
@@ -816,17 +855,44 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			if count == 0 {
 				count = len(g.Participants)
 			}
+			chatJID := g.JID.String()
 			out = append(out, groupOut{
-				JID:              g.JID.String(),
+				JID:              chatJID,
 				Name:             g.Name,
 				Topic:            g.Topic,
 				ParticipantCount: count,
+				AvatarID:         messageStore.GetAvatarID(chatJID), // cached, no network
 			})
 		}
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(out); err != nil {
 			fmt.Printf("/api/groups encode failed: %v\n", err)
 		}
+	})
+
+	// Handler for serving a group's cached avatar bytes (read-only).
+	http.HandleFunc("/api/group/avatar", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		jid := r.URL.Query().Get("jid")
+		if jid == "" {
+			http.Error(w, "jid query param required", http.StatusBadRequest)
+			return
+		}
+		var path sql.NullString
+		_ = messageStore.db.QueryRow("SELECT avatar_path FROM chats WHERE jid = ?", jid).Scan(&path)
+		if !path.Valid || path.String == "" {
+			http.Error(w, "no cached avatar", http.StatusNotFound)
+			return
+		}
+		if _, err := os.Stat(path.String); err != nil {
+			http.Error(w, "avatar file missing", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "image/jpeg")
+		http.ServeFile(w, r, path.String)
 	})
 
 	// Start the server
@@ -999,6 +1065,25 @@ func main() {
 		}
 	}()
 
+	// Group-avatar refresh: separate, slower cadence (avatars change rarely and
+	// each group is a throttled network call). Runs once after a short delay so
+	// the first subject refresh completes first, then on a 24h ticker.
+	go func() {
+		time.Sleep(20 * time.Second)
+		refreshGroupAvatars(client, messageStore, logger)
+		interval := 24 * time.Hour
+		if v := os.Getenv("GROUP_AVATAR_INTERVAL"); v != "" {
+			if d, err := time.ParseDuration(v); err == nil && d > 0 {
+				interval = d
+			}
+		}
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for range ticker.C {
+			refreshGroupAvatars(client, messageStore, logger)
+		}
+	}()
+
 	// Start REST API server. PORT env var honors the launchd plist setting
 	// (com.maya.whatsapp-bridge.plist sets 3456); falls back to 8080.
 	port := 8080
@@ -1059,6 +1144,76 @@ func refreshGroupSubjects(client *whatsmeow.Client, store *MessageStore, logger 
 		updated++
 	}
 	logger.Infof("refreshGroupSubjects: %d joined groups, %d names updated", len(groups), updated)
+}
+
+// avatarFileName maps a chat JID to a safe local filename under store/avatars/.
+func avatarFileName(chatJID string) string {
+	safe := strings.NewReplacer("@", "_", ":", "_", "/", "_").Replace(chatJID)
+	return safe + ".jpg"
+}
+
+// refreshGroupAvatars fetches + caches each joined group's profile picture.
+// It passes the cached avatar ID as ExistingID so whatsmeow returns "unchanged"
+// (nil,nil) for groups whose avatar hasn't changed — no re-download. Throttled
+// (>=500ms between groups) and run on a long cadence so it never risks the
+// account. Only groups with a NEW/CHANGED avatar incur a download.
+func refreshGroupAvatars(client *whatsmeow.Client, store *MessageStore, logger waLog.Logger) {
+	groups, err := client.GetJoinedGroups(context.Background())
+	if err != nil {
+		logger.Warnf("refreshGroupAvatars: GetJoinedGroups failed: %v", err)
+		return
+	}
+	avatarDir := "store/avatars"
+	if err := os.MkdirAll(avatarDir, 0o755); err != nil {
+		logger.Warnf("refreshGroupAvatars: mkdir %s failed: %v", avatarDir, err)
+		return
+	}
+	fetched := 0
+	for _, g := range groups {
+		chatJID := g.JID.String()
+		existingID := store.GetAvatarID(chatJID)
+		info, err := client.GetProfilePictureInfo(context.Background(), g.JID, &whatsmeow.GetProfilePictureParams{
+			Preview:    true,
+			ExistingID: existingID,
+		})
+		// (nil,nil) = unchanged; error = no picture / unauthorized — leave cache as-is.
+		if err != nil || info == nil || info.URL == "" {
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		// New/changed avatar — download the bytes.
+		path := filepath.Join(avatarDir, avatarFileName(chatJID))
+		if derr := downloadToFile(info.URL, path); derr != nil {
+			logger.Warnf("refreshGroupAvatars: download %s failed: %v", chatJID, derr)
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+		if serr := store.SetAvatar(chatJID, info.ID, path); serr != nil {
+			logger.Warnf("refreshGroupAvatars: SetAvatar %s failed: %v", chatJID, serr)
+		} else {
+			fetched++
+		}
+		time.Sleep(500 * time.Millisecond) // gentle on the account
+	}
+	logger.Infof("refreshGroupAvatars: %d joined groups, %d avatars fetched/updated", len(groups), fetched)
+}
+
+// downloadToFile GETs a URL and writes the body to path (used for the directly
+// downloadable profile-picture URLs whatsmeow returns).
+func downloadToFile(url, path string) error {
+	resp, err := http.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("http %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
 }
 
 // GetChatName determines the appropriate name for a chat based on JID and other info

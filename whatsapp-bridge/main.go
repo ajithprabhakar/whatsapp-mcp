@@ -93,6 +93,11 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
+	if err := ensureCallsTable(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to initialize calls: %w", err)
+	}
+
 	// Group-avatar cache columns (Phase 2). ALTER is idempotent across restarts:
 	// SQLite has no ADD COLUMN IF NOT EXISTS, so a "duplicate column" error on a
 	// second boot is expected and ignored.
@@ -957,6 +962,12 @@ func main() {
 
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
+		if handled, err := recordCallEvent(messageStore, evt, client.Store.ID, client.Store.LID); handled {
+			if err != nil {
+				logger.Errorf("Call observation persistence failed: %v", err)
+			}
+			return
+		}
 		switch v := evt.(type) {
 		case *events.Message:
 			// Process regular messages

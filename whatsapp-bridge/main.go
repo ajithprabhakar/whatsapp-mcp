@@ -901,15 +901,19 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
-	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
+	server := newRESTServer(port)
+	fmt.Printf("Starting REST API server on %s...\n", server.Addr)
 
 	// Run server in a goroutine so it doesn't block
 	go func() {
-		if err := http.ListenAndServe(serverAddr, nil); err != nil {
+		if err := server.ListenAndServe(); err != nil {
 			fmt.Printf("REST API server error: %v\n", err)
 		}
 	}()
+}
+
+func newRESTServer(port int) *http.Server {
+	return &http.Server{Addr: fmt.Sprintf("127.0.0.1:%d", port)}
 }
 
 func main() {

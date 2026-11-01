@@ -39,7 +39,19 @@ func historyCallObservation(r *waSyncAction.CallLogRecord, ownPN *types.JID, own
 		return invalid("invalid_id")
 	}
 	ts := r.GetStartTime()
-	if ts < 1230768000 || ts > now.Add(5*time.Minute).Unix() {
+	if ts <= 0 {
+		return invalid("invalid_time")
+	}
+	var at time.Time
+	switch {
+	case ts < 100_000_000_000:
+		at = time.Unix(ts, 0)
+	case ts < 100_000_000_000_000:
+		at = time.UnixMilli(ts)
+	default:
+		at = time.UnixMicro(ts)
+	}
+	if at.Before(time.Unix(1230768000, 0)) || at.After(now.Add(5*time.Minute)) {
 		return invalid("invalid_time")
 	}
 	if r.IsIncoming == nil {
@@ -95,7 +107,7 @@ func historyCallObservation(r *waSyncAction.CallLogRecord, ownPN *types.JID, own
 			media = "video"
 		}
 	}
-	return callObservation{id, remote, media, time.Unix(ts, 0)}, ""
+	return callObservation{id, remote, media, at}, ""
 }
 
 func callMedia(data *waBinary.Node) string {

@@ -76,7 +76,7 @@ func TestHistoryCallValidationAndBatchContinues(t *testing.T) {
 		{"zero-time", func(r *waSyncAction.CallLogRecord) { r.StartTime = proto.Int64(0) }},
 		{"negative-time", func(r *waSyncAction.CallLogRecord) { r.StartTime = proto.Int64(-1) }},
 		{"pre-era", func(r *waSyncAction.CallLogRecord) { r.StartTime = proto.Int64(1) }},
-		{"ms-time", func(r *waSyncAction.CallLogRecord) { r.StartTime = proto.Int64(time.Now().UnixMilli()) }},
+		{"ns-time", func(r *waSyncAction.CallLogRecord) { r.StartTime = proto.Int64(time.Now().UnixNano()) }},
 		{"overflow-time", func(r *waSyncAction.CallLogRecord) { r.StartTime = proto.Int64(9223372036854775807) }},
 		{"future-time", func(r *waSyncAction.CallLogRecord) { r.StartTime = proto.Int64(time.Now().Add(time.Hour).Unix()) }},
 		{"future-six-min", func(r *waSyncAction.CallLogRecord) { r.StartTime = proto.Int64(time.Now().Add(6 * time.Minute).Unix()) }},
@@ -198,6 +198,26 @@ func TestHistoryCallNamespacesMediaAndDiagnostics(t *testing.T) {
 		if _, reason := historyCallObservation(r, &own, ownLID, time.Now()); reason == "" {
 			t.Fatalf("invalid participant accepted: %q", invalid)
 		}
+	}
+}
+
+func TestHistoryCallTimestampUnitsActualHandler(t *testing.T) {
+	own, remote := jid("15550000001"), jid("15550000002")
+	at := time.Date(2026, 10, 1, 12, 34, 56, 123456000, time.UTC)
+	for _, raw := range []int64{at.Unix(), at.UnixMilli(), at.UnixMicro()} {
+		t.Run(fmt.Sprint(raw), func(t *testing.T) {
+			s := callStore(t)
+			client := whatsmeow.NewClient(&store.Device{ID: &own}, waLog.Noop)
+			r := &waSyncAction.CallLogRecord{CallID: proto.String("timestamp-fixture"), StartTime: proto.Int64(raw), IsIncoming: proto.Bool(true), CallCreatorJID: proto.String(remote.String())}
+			handleHistorySync(client, s, &events.HistorySync{Data: &waHistorySync.HistorySync{CallLogRecords: []*waSyncAction.CallLogRecord{r}}}, waLog.Noop)
+			var observed time.Time
+			if err := s.db.QueryRow("SELECT timestamp FROM calls").Scan(&observed); err != nil {
+				t.Fatal(err)
+			}
+			if !observed.Equal(at.Truncate(time.Second)) {
+				t.Fatalf("timestamp unit changed instant: %v", observed)
+			}
+		})
 	}
 }
 func TestCallLifecyclePersistsOnceAndPreservesSummary(t *testing.T) {

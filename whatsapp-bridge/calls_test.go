@@ -123,6 +123,9 @@ func TestHistoryCallValidationAndBatchContinues(t *testing.T) {
 		l := &callLogCapture{Logger: waLog.Noop}
 		handleHistorySync(client, s, &events.HistorySync{Data: &waHistorySync.HistorySync{CallLogRecords: []*waSyncAction.CallLogRecord{bad, base}}}, l)
 		log := strings.Join(l.lines, "\n")
+		if len(l.errors) != 1 || l.errors[0] != "History calls reason=persistence_failed count=1" {
+			t.Fatalf("persistence failure not reported at ERROR: %v", l.errors)
+		}
 		if !strings.Contains(log, "persistence_failed:1") || strings.Contains(log, "conflict") || strings.Contains(log, remote.User) || strings.Contains(log, "call identity") {
 			t.Fatalf("unsafe or missing persistence diagnostics: %s", log)
 		}
@@ -146,11 +149,16 @@ func TestHistoryCallValidationAndBatchContinues(t *testing.T) {
 
 type callLogCapture struct {
 	waLog.Logger
-	lines []string
+	lines  []string
+	errors []string
 }
 
-func (l *callLogCapture) Infof(f string, a ...any)  { l.lines = append(l.lines, fmt.Sprintf(f, a...)) }
-func (l *callLogCapture) Errorf(f string, a ...any) { l.lines = append(l.lines, fmt.Sprintf(f, a...)) }
+func (l *callLogCapture) Infof(f string, a ...any) { l.lines = append(l.lines, fmt.Sprintf(f, a...)) }
+func (l *callLogCapture) Errorf(f string, a ...any) {
+	line := fmt.Sprintf(f, a...)
+	l.lines = append(l.lines, line)
+	l.errors = append(l.errors, line)
+}
 
 func TestHistoryCallNamespacesMediaAndDiagnostics(t *testing.T) {
 	own := jid("15550000001")
@@ -185,6 +193,9 @@ func TestHistoryCallNamespacesMediaAndDiagnostics(t *testing.T) {
 			}
 			if !strings.Contains(log, "seen=2 stored=1") || !strings.Contains(log, "invalid_record:1") {
 				t.Fatalf("missing sanitized counts: %s", log)
+			}
+			if len(l.errors) != 0 {
+				t.Fatalf("validation skip reported as storage error: %v", l.errors)
 			}
 		})
 	}

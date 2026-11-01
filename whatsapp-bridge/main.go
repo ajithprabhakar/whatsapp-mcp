@@ -1338,6 +1338,9 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 			reasons[reason]++
 		}
 	}
+	if failures := reasons["persistence_failed"]; failures > 0 {
+		logger.Errorf("History calls reason=persistence_failed count=%d", failures)
+	}
 	logger.Infof("History calls seen=%d stored=%d skipped=%v", len(historySync.Data.GetCallLogRecords()), stored, reasons)
 	fmt.Printf("Received history sync event with %d conversations\n", len(historySync.Data.Conversations))
 

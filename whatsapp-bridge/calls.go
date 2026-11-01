@@ -7,6 +7,7 @@ import (
 	"go.mau.fi/whatsmeow/proto/waSyncAction"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
+	waLog "go.mau.fi/whatsmeow/util/log"
 	"strings"
 	"time"
 	"unicode"
@@ -182,6 +183,36 @@ func recordCallEvent(store *MessageStore, evt any, ownPN *types.JID, ownLID type
 		return true, nil
 	}
 	return true, store.storeCallObservation(callObservation{meta.CallID, partner, media, meta.Timestamp})
+}
+
+func handleCallEvent(store *MessageStore, evt any, ownPN *types.JID, ownLID types.JID, logger waLog.Logger) bool {
+	if update, ok := evt.(*events.AppState); ok {
+		if update == nil || update.SyncActionValue == nil || update.GetCallLogAction() == nil {
+			return false
+		}
+		observation, reason := historyCallObservation(update.GetCallLogAction().GetCallLogRecord(), ownPN, ownLID, time.Now())
+		stored := 0
+		if reason == "" {
+			if err := store.storeCallObservation(observation); err != nil {
+				reason = "persistence_failed"
+				logger.Errorf("AppState calls reason=persistence_failed count=1")
+			} else {
+				stored = 1
+				reason = "stored"
+			}
+		}
+		logger.Infof("AppState calls seen=1 stored=%d reason=%s", stored, reason)
+		return true
+	}
+	if handled, err := recordCallEvent(store, evt, ownPN, ownLID); handled {
+		if err != nil {
+			logger.Errorf("Call event handled=1 reason=persistence_failed")
+		} else {
+			logger.Infof("Call event handled=1 reason=processed")
+		}
+		return true
+	}
+	return false
 }
 
 func (store *MessageStore) storeCallObservation(o callObservation) error {

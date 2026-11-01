@@ -231,6 +231,112 @@ func TestHistoryCallTimestampUnitsActualHandler(t *testing.T) {
 		})
 	}
 }
+
+func TestNormalCallLogDispatchAndHistoryReplay(t *testing.T) {
+	s := callStore(t)
+	own, remote := jid("15550000001"), jid("15550000002")
+	r := &waSyncAction.CallLogRecord{CallID: proto.String("normal-fixture"), StartTime: proto.Int64(time.Now().Add(-time.Hour).UnixMilli()), IsIncoming: proto.Bool(false), IsVideo: proto.Bool(true), CallCreatorJID: proto.String(own.String()), Participants: []*waSyncAction.CallLogRecord_ParticipantInfo{{UserJID: proto.String(remote.String())}}}
+	evt := &events.AppState{SyncActionValue: &waSyncAction.SyncActionValue{CallLogAction: &waSyncAction.CallLogAction{CallLogRecord: r}}}
+	l := &callLogCapture{Logger: waLog.Noop}
+	if !handleCallEvent(s, evt, &own, types.EmptyJID, l) {
+		t.Fatal("normal call-log not handled")
+	}
+	if _, err := s.db.Exec("UPDATE calls SET summary='owner summary'"); err != nil {
+		t.Fatal(err)
+	}
+	r.IsVideo = proto.Bool(false)
+	client := whatsmeow.NewClient(&store.Device{ID: &own}, waLog.Noop)
+	handleHistorySync(client, s, &events.HistorySync{Data: &waHistorySync.HistorySync{CallLogRecords: []*waSyncAction.CallLogRecord{r}}}, waLog.Noop)
+	if !handleCallEvent(s, evt, &own, types.EmptyJID, l) {
+		t.Fatal("normal replay not handled")
+	}
+	var n int
+	var partner, media, summary string
+	if err := s.db.QueryRow("SELECT count(*),caller_jid,call_type,summary FROM calls").Scan(&n, &partner, &media, &summary); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 || partner != remote.String() || media != "video" || summary != "owner summary" {
+		t.Fatal("normal/history replay lost identity or owner data")
+	}
+}
+
+func TestNormalCallLogDispatchBoundaries(t *testing.T) {
+	own, remote := jid("15550000001"), jid("15550000002")
+	for _, evt := range []any{(*events.AppState)(nil), &events.AppState{}, &events.AppState{SyncActionValue: &waSyncAction.SyncActionValue{}}, &events.Message{}} {
+		s := callStore(t)
+		l := &callLogCapture{Logger: waLog.Noop}
+		if handleCallEvent(s, evt, &own, types.EmptyJID, l) || len(l.lines) != 0 {
+			t.Fatal("unrelated event intercepted/logged")
+		}
+	}
+	base := &waSyncAction.CallLogRecord{CallID: proto.String("private-id"), StartTime: proto.Int64(time.Now().UnixMicro()), IsIncoming: proto.Bool(true), CallCreatorJID: proto.String(remote.String())}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*waSyncAction.CallLogRecord)
+		reason string
+	}{
+		{"direction", func(r *waSyncAction.CallLogRecord) { r.IsIncoming = nil }, "missing_direction"},
+		{"group", func(r *waSyncAction.CallLogRecord) { r.GroupJID = proto.String("private@g.us") }, "group_or_link"},
+		{"timestamp", func(r *waSyncAction.CallLogRecord) { r.StartTime = nil }, "invalid_time"},
+		{"ambiguous", func(r *waSyncAction.CallLogRecord) {
+			r.Participants = []*waSyncAction.CallLogRecord_ParticipantInfo{{UserJID: proto.String("8888888888888888@lid")}}
+		}, "ambiguous_partner"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := callStore(t)
+			l := &callLogCapture{Logger: waLog.Noop}
+			r := proto.Clone(base).(*waSyncAction.CallLogRecord)
+			tc.mutate(r)
+			evt := &events.AppState{SyncActionValue: &waSyncAction.SyncActionValue{CallLogAction: &waSyncAction.CallLogAction{CallLogRecord: r}}}
+			if !handleCallEvent(s, evt, &own, types.EmptyJID, l) {
+				t.Fatal("call-log update fell through")
+			}
+			if strings.Join(l.lines, "\n") != "AppState calls seen=1 stored=0 reason="+tc.reason || len(l.errors) != 0 {
+				t.Fatalf("unsafe/incorrect diagnostics: %v", l.lines)
+			}
+			var n int
+			s.db.QueryRow("SELECT count(*) FROM calls").Scan(&n)
+			if n != 0 {
+				t.Fatal("invalid update stored")
+			}
+		})
+	}
+	t.Run("nil-record", func(t *testing.T) {
+		s := callStore(t)
+		l := &callLogCapture{Logger: waLog.Noop}
+		evt := &events.AppState{SyncActionValue: &waSyncAction.SyncActionValue{CallLogAction: &waSyncAction.CallLogAction{}}}
+		if !handleCallEvent(s, evt, &own, types.EmptyJID, l) || strings.Join(l.lines, "") != "AppState calls seen=1 stored=0 reason=invalid_record" {
+			t.Fatalf("nil record diagnostics: %v", l.lines)
+		}
+	})
+	t.Run("storage-error-then-valid", func(t *testing.T) {
+		s := callStore(t)
+		l := &callLogCapture{Logger: waLog.Noop}
+		if err := s.storeCallObservation(callObservation{base.GetCallID(), jid("15550000003"), "video", time.Now()}); err != nil {
+			t.Fatal(err)
+		}
+		evt := &events.AppState{SyncActionValue: &waSyncAction.SyncActionValue{CallLogAction: &waSyncAction.CallLogAction{CallLogRecord: base}}}
+		if !handleCallEvent(s, evt, &own, types.EmptyJID, l) || len(l.errors) != 1 || l.errors[0] != "AppState calls reason=persistence_failed count=1" {
+			t.Fatalf("storage error not loud/sanitized: %v", l.lines)
+		}
+		base = proto.Clone(base).(*waSyncAction.CallLogRecord)
+		base.CallID = proto.String("next-update")
+		evt.CallLogAction.CallLogRecord = base
+		if !handleCallEvent(s, evt, &own, types.EmptyJID, l) {
+			t.Fatal("next valid update ignored")
+		}
+		var n int
+		s.db.QueryRow("SELECT count(*) FROM calls").Scan(&n)
+		if n != 2 {
+			t.Fatal("valid update lost after failure")
+		}
+		for _, line := range l.lines {
+			if strings.Contains(line, "private-id") || strings.Contains(line, remote.User) || strings.Contains(line, "call identity") {
+				t.Fatal("raw identity/error logged")
+			}
+		}
+	})
+}
 func TestCallLifecyclePersistsOnceAndPreservesSummary(t *testing.T) {
 	s := callStore(t)
 	own, remote := jid("15550000001"), jid("15550000002")

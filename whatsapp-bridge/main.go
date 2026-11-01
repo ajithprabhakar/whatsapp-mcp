@@ -966,12 +966,7 @@ func main() {
 
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
-		if handled, err := recordCallEvent(messageStore, evt, client.Store.ID, client.Store.LID); handled {
-			if err != nil {
-				logger.Errorf("Call event handled=1 reason=persistence_failed")
-			} else {
-				logger.Infof("Call event handled=1 reason=processed")
-			}
+		if handleCallEvent(messageStore, evt, client.Store.ID, client.Store.LID, logger) {
 			return
 		}
 		switch v := evt.(type) {

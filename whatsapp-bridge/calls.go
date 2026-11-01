@@ -4,10 +4,12 @@ import (
 	"database/sql"
 	"fmt"
 	waBinary "go.mau.fi/whatsmeow/binary"
+	"go.mau.fi/whatsmeow/proto/waSyncAction"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	"strings"
 	"time"
+	"unicode"
 )
 
 func ensureCallsTable(db *sql.DB) error {
@@ -22,6 +24,78 @@ type callObservation struct {
 	remote types.JID
 	media  string
 	at     time.Time
+}
+
+func historyCallObservation(r *waSyncAction.CallLogRecord, ownPN *types.JID, ownLID types.JID, now time.Time) (callObservation, string) {
+	invalid := func(reason string) (callObservation, string) { return callObservation{}, reason }
+	if r == nil {
+		return invalid("invalid_record")
+	}
+	if ownPN == nil || ownPN.IsEmpty() {
+		return invalid("missing_owner")
+	}
+	id := r.GetCallID()
+	if id == "" || strings.TrimSpace(id) != id || strings.ContainsFunc(id, unicode.IsControl) {
+		return invalid("invalid_id")
+	}
+	ts := r.GetStartTime()
+	if ts < 1230768000 || ts > now.Add(5*time.Minute).Unix() {
+		return invalid("invalid_time")
+	}
+	if r.IsIncoming == nil {
+		return invalid("missing_direction")
+	}
+	if r.GetGroupJID() != "" || r.GetIsCallLink() || r.GetCallLinkToken() != "" || r.GetCallType() != waSyncAction.CallLogRecord_REGULAR {
+		return invalid("group_or_link")
+	}
+	parse := func(raw string) (types.JID, bool) {
+		j, err := types.ParseJID(raw)
+		if err != nil || j.IsEmpty() || j != j.ToNonAD() || (j.Server != types.DefaultUserServer && j.Server != types.HiddenUserServer) {
+			return types.EmptyJID, false
+		}
+		for _, digit := range j.User {
+			if digit < '0' || digit > '9' {
+				return types.EmptyJID, false
+			}
+		}
+		return j, true
+	}
+	isOwn := func(j types.JID) bool { return j == ownPN.ToNonAD() || (!ownLID.IsEmpty() && j == ownLID.ToNonAD()) }
+	creator, ok := parse(r.GetCallCreatorJID())
+	if !ok {
+		return invalid("invalid_creator")
+	}
+	if r.GetIsIncoming() == isOwn(creator) {
+		return invalid("direction_conflict")
+	}
+	remote := types.EmptyJID
+	if !isOwn(creator) {
+		remote = creator
+	}
+	for _, participant := range r.GetParticipants() {
+		j, valid := parse(participant.GetUserJID())
+		if !valid {
+			return invalid("invalid_participant")
+		}
+		if isOwn(j) {
+			continue
+		}
+		if !remote.IsEmpty() && remote != j {
+			return invalid("ambiguous_partner")
+		}
+		remote = j
+	}
+	if remote.IsEmpty() {
+		return invalid("missing_partner")
+	}
+	media := "unknown"
+	if r.IsVideo != nil {
+		media = "voice"
+		if r.GetIsVideo() {
+			media = "video"
+		}
+	}
+	return callObservation{id, remote, media, time.Unix(ts, 0)}, ""
 }
 
 func callMedia(data *waBinary.Node) string {

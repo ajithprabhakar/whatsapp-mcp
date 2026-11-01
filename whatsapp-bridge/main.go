@@ -968,7 +968,9 @@ func main() {
 	client.AddEventHandler(func(evt interface{}) {
 		if handled, err := recordCallEvent(messageStore, evt, client.Store.ID, client.Store.LID); handled {
 			if err != nil {
-				logger.Errorf("Call observation persistence failed: %v", err)
+				logger.Errorf("Call event handled=1 reason=persistence_failed")
+			} else {
+				logger.Infof("Call event handled=1 reason=processed")
 			}
 			return
 		}
@@ -1318,6 +1320,25 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 // Handle history sync events
 func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, historySync *events.HistorySync, logger waLog.Logger) {
+	if historySync == nil || historySync.Data == nil {
+		return
+	}
+	stored := 0
+	reasons := map[string]int{}
+	for _, record := range historySync.Data.GetCallLogRecords() {
+		observation, reason := historyCallObservation(record, client.Store.ID, client.Store.LID, time.Now())
+		if reason == "" {
+			if err := messageStore.storeCallObservation(observation); err != nil {
+				reason = "persistence_failed"
+			} else {
+				stored++
+			}
+		}
+		if reason != "" {
+			reasons[reason]++
+		}
+	}
+	logger.Infof("History calls seen=%d stored=%d skipped=%v", len(historySync.Data.GetCallLogRecords()), stored, reasons)
 	fmt.Printf("Received history sync event with %d conversations\n", len(historySync.Data.Conversations))
 
 	syncedCount := 0

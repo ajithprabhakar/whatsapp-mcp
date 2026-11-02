@@ -728,10 +728,7 @@ func extractDirectPathFromURL(url string) string {
 
 	pathPart := parts[1]
 
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-
-	// Create proper direct path format
+	// The query authenticates the media; whatsmeow appends its own hash fields.
 	return "/" + pathPart
 }
 
